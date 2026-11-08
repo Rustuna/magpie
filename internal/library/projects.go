@@ -31,6 +31,10 @@ type Project struct {
 	// once they're empty; Gitignore is whether it made the .gitignore
 	Made      []string `json:"made,omitempty"`
 	Gitignore bool     `json:"gitignore,omitempty"`
+	// Ignore is where the lines listing what magpie placed go (#5670):
+	// IgnoreInGitignore (and "", from before there was a choice),
+	// IgnoreInExclude or IgnoreNowhere
+	Ignore string `json:"ignore,omitempty"`
 	// Servers are the library's MCP servers the project has, and for which
 	// agents (project_mcp.go)
 	Servers map[string][]string `json:"servers,omitempty"`
@@ -101,11 +105,32 @@ func (l *Library) project(dir string) *Project {
 	return nil
 }
 
-// The .gitignore lines magpie keeps between these two, and only there.
+// The ignore lines magpie keeps between these two, and only there.
 const (
 	ignoreBegin = "# >>> magpie: library skills placed here (magpie adds and removes these lines) >>>"
 	ignoreEnd   = "# <<< magpie <<<"
 )
+
+// Where a project's ignore lines go (#5670). In a repository whose
+// .gitignore is tracked, magpie's lines there leave every checkout dirty,
+// and `git add -A` would commit them. Its repository's exclude file
+// (.git/info/exclude) is read like the root's .gitignore but never
+// tracked, and the linked worktrees of one clone share it. A folder whose
+// own ignore rules cover what magpie places needs no lines at all.
+const (
+	IgnoreInGitignore = "gitignore"
+	IgnoreInExclude   = "exclude"
+	IgnoreNowhere     = "none"
+)
+
+// ignoreWhere is where the project's ignore lines go: a record from before
+// there was a choice says the .gitignore.
+func (p *Project) ignoreWhere() string {
+	if p.Ignore == IgnoreInExclude || p.Ignore == IgnoreNowhere {
+		return p.Ignore
+	}
+	return IgnoreInGitignore
+}
 
 // syncProjects places the library's skills in every project as it says.
 func (l *Library) syncProjects(res *Result) {
@@ -176,7 +201,7 @@ func (l *Library) syncProject(p *Project, res *Result) {
 		res.Problems = append(res.Problems, Problem{Agent: p.Dir, What: "project:" + what, Error: err.Error()})
 	})
 	if err := p.writeIgnore(); err != nil {
-		fail("", fmt.Errorf(".gitignore: %w", err))
+		fail("", err)
 	}
 	p.tidy()
 }
@@ -260,11 +285,52 @@ func (p *Project) tidy() {
 	p.Made = kept
 }
 
-// writeIgnore keeps the project's .gitignore listing what magpie placed,
-// between its two lines; the rest of the file is the user's and stays.
-// A .gitignore magpie made is taken away once nothing's left in it.
+// writeIgnore keeps the lines listing what magpie placed where the project
+// says (ignoreWhere), between magpie's two marker lines: in the project's
+// .gitignore, or in its repository's exclude file, written from the
+// repository's root down. The rest of either file is the user's and stays,
+// and the file not chosen loses the lines it has from before the choice. A
+// .gitignore magpie made is taken away once nothing's left in it; the
+// exclude file is the repository's and stays.
 func (p *Project) writeIgnore() error {
-	f := filepath.Join(p.Dir, ".gitignore")
+	ignored := slices.Concat(p.Placed, p.MadeFiles)
+	sort.Strings(ignored)
+	where := p.ignoreWhere()
+	var inGitignore []string
+	if where == IgnoreInGitignore {
+		inGitignore = ignored
+	}
+	if err := writeIgnoreLines(filepath.Join(p.Dir, ".gitignore"), inGitignore, &p.Gitignore); err != nil {
+		return fmt.Errorf(".gitignore: %w", err)
+	}
+	exclude, below, err := excludeFile(p.Dir)
+	if err != nil {
+		if where == IgnoreInExclude {
+			return fmt.Errorf("exclude file: %w", err)
+		}
+		return nil // no exclude file found to take old lines out of
+	}
+	var inExclude []string
+	if where == IgnoreInExclude {
+		for _, e := range ignored {
+			if below != "" {
+				e = below + "/" + e
+			}
+			inExclude = append(inExclude, e)
+		}
+	}
+	if err := writeIgnoreLines(exclude, inExclude, nil); err != nil {
+		return fmt.Errorf("%s: %w", exclude, err)
+	}
+	return nil
+}
+
+// writeIgnoreLines keeps lines between magpie's two marker lines in the
+// ignore file f, with the rest of it the user's, as it is, in the line
+// endings it has; given no lines, it takes magpie's out. made, when given,
+// is whether magpie made the file, which is then taken away once nothing's
+// left in it.
+func writeIgnoreLines(f string, lines []string, made *bool) error {
 	b, err := os.ReadFile(f)
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -274,15 +340,13 @@ func (p *Project) writeIgnore() error {
 	if strings.Contains(string(b), "\r\n") {
 		nl = "\r\n"
 	}
-	rest := stripIgnore(strings.ReplaceAll(string(b), "\r\n", "\n"))
-	out := rest
-	if ignored := slices.Concat(p.Placed, p.MadeFiles); len(ignored) > 0 {
-		sort.Strings(ignored)
+	out := stripIgnore(strings.ReplaceAll(string(b), "\r\n", "\n"))
+	if len(lines) > 0 {
 		if out != "" {
 			out += "\n"
 		}
 		out += ignoreBegin + "\n"
-		for _, e := range ignored {
+		for _, e := range lines {
 			out += "/" + e + "\n"
 		}
 		out += ignoreEnd + "\n"
@@ -292,20 +356,89 @@ func (p *Project) writeIgnore() error {
 	case out == string(b) && had:
 		return nil
 	case strings.TrimSpace(out) == "":
-		if had && p.Gitignore {
-			p.Gitignore = false
+		if had && made != nil && *made {
+			*made = false
 			return os.Remove(f)
 		}
 		if !had {
 			return nil
 		}
 	case !had:
-		p.Gitignore = true
+		if made != nil {
+			*made = true
+		}
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			return err
+		}
 	}
 	return edit.WriteAtomic(f, []byte(out))
 }
 
-// stripIgnore is a .gitignore without magpie's lines, and the blank line
+// errNoRepository is a project folder with no .git in it or above it.
+var errNoRepository = errors.New("isn't in a git repository")
+
+// excludeFile is the exclude file of the repository holding dir, and the
+// path from the repository's root down to dir ("" at the root), which its
+// lines are written from, since git reads the file like the root's
+// .gitignore. It is found without running git: the nearest folder up from
+// dir with a .git in it, a folder or a file naming one (a linked worktree,
+// a submodule), and the clone's common folder when the worktree's names
+// one (commondir), so every worktree of a clone shares the file.
+func excludeFile(dir string) (file, below string, err error) {
+	for d := dir; ; d = filepath.Dir(d) {
+		g := filepath.Join(d, ".git")
+		fi, err := os.Stat(g)
+		switch {
+		case err == nil:
+			gitdir := g
+			if !fi.IsDir() {
+				if gitdir, err = gitdirOf(g); err != nil {
+					return "", "", err
+				}
+			}
+			if b, err := os.ReadFile(filepath.Join(gitdir, "commondir")); err == nil {
+				c := strings.TrimSpace(string(b))
+				if !filepath.IsAbs(c) {
+					c = filepath.Join(gitdir, c)
+				}
+				gitdir = filepath.Clean(c)
+			}
+			rel, err := filepath.Rel(d, dir)
+			if err != nil {
+				return "", "", err
+			}
+			if rel == "." {
+				rel = ""
+			}
+			return filepath.Join(gitdir, "info", "exclude"), filepath.ToSlash(rel), nil
+		case !os.IsNotExist(err):
+			return "", "", err
+		}
+		if filepath.Dir(d) == d {
+			return "", "", fmt.Errorf("%s %w", dir, errNoRepository)
+		}
+	}
+}
+
+// gitdirOf is the folder a .git file names ("gitdir: <path>", relative to
+// the file's folder when not absolute).
+func gitdirOf(f string) (string, error) {
+	b, err := os.ReadFile(f)
+	if err != nil {
+		return "", err
+	}
+	p, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir:")
+	if !ok {
+		return "", fmt.Errorf("%s names no git folder", f)
+	}
+	p = filepath.FromSlash(strings.TrimSpace(p))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(filepath.Dir(f), p)
+	}
+	return filepath.Clean(p), nil
+}
+
+// stripIgnore is an ignore file without magpie's lines, and the blank line
 // left before them.
 func stripIgnore(s string) string {
 	var out []string
@@ -463,11 +596,38 @@ func ProjectCopy(dir string, copy bool) (*Result, error) {
 	})
 }
 
+// ProjectIgnore sets where a project's ignore lines go (#5670): its
+// .gitignore, its repository's exclude file, or nowhere. The lines move at
+// the sync that follows. A folder in no repository has no exclude file.
+func ProjectIgnore(dir, where string) (*Result, error) {
+	if where != IgnoreInGitignore && where != IgnoreInExclude && where != IgnoreNowhere {
+		return nil, fmt.Errorf("the ignore lines go in %s, %s or %s, not %q", IgnoreInGitignore, IgnoreInExclude, IgnoreNowhere, where)
+	}
+	return change(func(l *Library) error {
+		p := l.project(dir)
+		if p == nil {
+			return fmt.Errorf("no project %s", dir)
+		}
+		if where == IgnoreInExclude {
+			if _, _, err := excludeFile(p.Dir); err != nil {
+				return err
+			}
+		}
+		p.Ignore = where
+		return nil
+	})
+}
+
 // ProjectView is a project as the page shows it.
 type ProjectView struct {
-	Dir     string              `json:"dir"`
-	Name    string              `json:"name"`
-	Copy    bool                `json:"copy"`
+	Dir  string `json:"dir"`
+	Name string `json:"name"`
+	Copy bool   `json:"copy"`
+	// Ignore is where its ignore lines go (IgnoreInGitignore, IgnoreInExclude
+	// or IgnoreNowhere); Git is whether the folder is in a git repository,
+	// whose exclude file could take them
+	Ignore  string              `json:"ignore"`
+	Git     bool                `json:"git"`
 	Skills  map[string][]string `json:"skills"`
 	Placed  []string            `json:"placed"`
 	Servers map[string][]string `json:"servers"`
@@ -481,7 +641,9 @@ type ProjectView struct {
 func projectViews(l *Library, problems []Problem) []ProjectView {
 	out := []ProjectView{}
 	for _, p := range l.Projects {
-		v := ProjectView{Dir: p.Dir, Name: filepath.Base(p.Dir), Copy: p.Copy, Skills: map[string][]string{}, Placed: append([]string{}, p.Placed...)}
+		v := ProjectView{Dir: p.Dir, Name: filepath.Base(p.Dir), Copy: p.Copy, Ignore: p.ignoreWhere(), Skills: map[string][]string{}, Placed: append([]string{}, p.Placed...)}
+		_, _, err := excludeFile(p.Dir)
+		v.Git = err == nil
 		for k, a := range p.Skills {
 			v.Skills[k] = append([]string{}, a...)
 		}

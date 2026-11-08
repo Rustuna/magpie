@@ -495,6 +495,7 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Values   map[string]string // what a market server needs
 			Dir      string            // a project's folder
 			Copy     bool              // a project gets copies, not links
+			Ignore   string            // where a project's ignore lines go: gitignore, exclude or none (#5670)
 			Keep     bool              // a project removed keeps what magpie put in it
 			On       bool              // every skill or server given to the agents, or taken from them
 			How      string            // link or copy: how skills are given to Agent, or to every agent with none (#896)
@@ -650,6 +651,8 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.ProjectServer(in.Dir, in.Name, in.Agents)
 		case "projects/copy":
 			res, err = library.ProjectCopy(in.Dir, in.Copy)
+		case "projects/ignore":
+			res, err = library.ProjectIgnore(in.Dir, in.Ignore)
 		case "all/sync":
 			res, err = library.Sync()
 		default:

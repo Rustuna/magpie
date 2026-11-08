@@ -4905,6 +4905,31 @@ magpie.plugin("library", (ctx) => {
       : t("Links follow the library's skill: an update reaches the project at once.")));
     card.append(opts);
 
+    // #5670: where the lines listing what magpie placed go. A tracked
+    // .gitignore with them in it leaves the checkout dirty, so a project
+    // in a repository can have them in its exclude file, or nowhere.
+    const where = ignoreWhere(p);
+    const ign = el("div", "lib-projopts lib-projignore");
+    const seg = segs([["gitignore", t("Its .gitignore")], ["exclude", t("The repository's exclude file")], ["none", t("Nowhere")]], where, (w) => {
+      if (w === where) return;
+      change("projects/ignore", { dir: p.dir, ignore: w }, {
+        gitignore: t("{name}'s ignore lines go to its .gitignore now", { name: p.name }),
+        exclude: t("{name}'s ignore lines go to the repository's exclude file now", { name: p.name }),
+        none: t("{name} gets no ignore lines now", { name: p.name }),
+      }[w]);
+    });
+    if (!p.git) {
+      const ex = seg.querySelectorAll(".opt")[1];
+      ex.disabled = true;
+      ex.title = t("Not in a git repository: there is no exclude file to use.");
+    }
+    ign.append(el("span", "lib-projcopy", t("Ignore lines go to")), seg, el("span", "note", {
+      gitignore: t("Listed in the project's .gitignore, between two lines of magpie's; the rest of the file is yours."),
+      exclude: t("Listed in the repository's .git/info/exclude, which git never tracks and every worktree of the clone shares; the project's .gitignore is left alone."),
+      none: t("Nothing is written to an ignore file: your own rules keep the placed folders out of git."),
+    }[where]));
+    card.append(ign);
+
     const all = projectAgents();
     for (const s of lib.skills) {
       const row = el("div", "row lib-row lib-projskill");
@@ -4925,7 +4950,11 @@ magpie.plugin("library", (ctx) => {
       card.append(row);
     }
     const dirs = [...new Set(all.map((a) => a.projectSkills))];
-    card.append(el("p", "lib-aside lib-projfoot", t("Placed in {dirs} of the project and listed in its .gitignore. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") })));
+    card.append(el("p", "lib-aside lib-projfoot", {
+      gitignore: t("Placed in {dirs} of the project and listed in its .gitignore. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") }),
+      exclude: t("Placed in {dirs} of the project and listed in the repository's .git/info/exclude. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") }),
+      none: t("Placed in {dirs} of the project, listed in no ignore file. A folder there that isn't magpie's is left as it is.", { dirs: dirs.join(", ") }),
+    }[where]));
     const skip = shownAgents().filter((a) => a.skills && !a.projectSkills);
     if (skip.length) card.append(el("p", "lib-aside lib-projfoot", t("{agents} reads no project skills folder magpie knows of.", { agents: skip.map((a) => a.name).join(", ") })));
     return card;
@@ -4984,12 +5013,20 @@ magpie.plugin("library", (ctx) => {
       card.append(row);
     }
     if (!lib.servers.length) card.append(el("p", "lib-aside lib-projfoot", t("No servers in the library yet")));
-    card.append(el("p", "lib-aside lib-projfoot", t("Written into {files} of the project, beside what's in them; a file magpie makes is listed in its .gitignore. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() })));
+    card.append(el("p", "lib-aside lib-projfoot", {
+      gitignore: t("Written into {files} of the project, beside what's in them; a file magpie makes is listed in its .gitignore. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() }),
+      exclude: t("Written into {files} of the project, beside what's in them; a file magpie makes is listed in the repository's .git/info/exclude. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() }),
+      none: t("Written into {files} of the project, beside what's in them; a file magpie makes is listed in no ignore file. A server there by the same name that isn't magpie's is left as it is.", { files: projectFiles() }),
+    }[ignoreWhere(p)]));
     card.append(el("p", "lib-aside lib-projfoot", t("Claude Code asks before it starts a project's servers; Codex reads .codex/config.toml, and Pi .pi/mcp.json, only in a project you trust.")));
     const skip = shownAgents().filter((a) => a.mcp && !a.projectMCP);
     if (skip.length) card.append(el("p", "lib-aside lib-projfoot", t("{agents} reads no project MCP file magpie knows of.", { agents: skip.map((a) => a.name).join(", ") })));
     return card;
   }
+
+  // Where a project's ignore lines go (#5670), as the page draws it: a
+  // project from before the choice says its .gitignore.
+  const ignoreWhere = (p) => (["exclude", "none"].includes(p.ignore) ? p.ignore : "gitignore");
 
   function confirmRemoveProject(p) {
     const ed = el("div", "editor lib-editor");
@@ -5003,10 +5040,19 @@ magpie.plugin("library", (ctx) => {
     const has = p.placed?.length || Object.values(p.wrote || {}).some((x) => x.length);
     const keep = el("input");
     keep.type = "checkbox";
+    const where = ignoreWhere(p);
     const tell = () => {
       say.textContent = keep.checked
-        ? t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, with their lines in its .gitignore, and are yours from then on; a linked skill still follows the library's.")
-        : t("The skills and MCP servers magpie put in it are taken away, with their lines in its .gitignore. Nothing else in the folder is touched.");
+        ? {
+          gitignore: t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, with their lines in its .gitignore, and are yours from then on; a linked skill still follows the library's."),
+          exclude: t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, with their lines in the repository's .git/info/exclude, and are yours from then on; a linked skill still follows the library's."),
+          none: t("magpie forgets the project. The skills and MCP servers it put in the folder stay there as they are, and are yours from then on; a linked skill still follows the library's."),
+        }[where]
+        : {
+          gitignore: t("The skills and MCP servers magpie put in it are taken away, with their lines in its .gitignore. Nothing else in the folder is touched."),
+          exclude: t("The skills and MCP servers magpie put in it are taken away, with their lines in the repository's .git/info/exclude. Nothing else in the folder is touched."),
+          none: t("The skills and MCP servers magpie put in it are taken away. Nothing else in the folder is touched."),
+        }[where];
     };
     keep.onchange = tell;
     if (has) {
